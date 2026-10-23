@@ -1,10 +1,11 @@
 import type {
   Middleware,
-  MiddlewareAborted,
+  MiddlewareContext,
   MiddlewareMetadata,
+  PriceMetadata,
   PriceQuote,
   Transaction,
-} from './index.js'
+} from './core.js'
 
 // -------------------------------------------------------------------------------------------------------
 // Validation
@@ -83,18 +84,32 @@ export const slippageRule: ValidationRule = (input) => {
   }
 }
 
-export interface ValidationMetadata extends MiddlewareMetadata {
+export interface ValidationMetadata extends PriceMetadata {
   amount?: bigint
   deadline?: number
-  quote?: PriceQuote
   minRatio?: PriceQuote
 }
 
-/** Builds a middleware that runs each rule against the context metadata.
- *  Any rule that throws aborts the chain (because next() is never called),
- *  and the error propagates to the caller. */
+export interface ValidationOptions<TTransaction extends Transaction> {
+  /**
+   * Picks the values to validate, e.g. from the transaction itself. Whatever it
+   * returns overrides the same-named `ctx.metadata` entries.
+   */
+  select?: (
+    ctx: MiddlewareContext<TTransaction, ValidationMetadata>,
+  ) => Partial<ValidationInput>
+}
+
+/**
+ * Builds a middleware that runs each rule against the amount, deadline, quote
+ * and `minRatio` found in `ctx.metadata` (or returned by `options.select`).
+ * A rule that throws a `ValidationError` aborts the chain with that error
+ * before `next()` runs, so nothing downstream, including submission, happens.
+ * Valid input passes through unchanged.
+ */
 export function validationMiddleware<TTransaction extends Transaction>(
   rules: ReadonlyArray<ValidationRule>,
+  options: ValidationOptions<TTransaction> = {},
 ): Middleware<TTransaction, ValidationMetadata> {
   return async (ctx, next) => {
     const input: ValidationInput = {
@@ -102,6 +117,7 @@ export function validationMiddleware<TTransaction extends Transaction>(
       deadline: ctx.metadata.deadline,
       quote: ctx.metadata.quote,
       minRatio: ctx.metadata.minRatio ?? { numerator: 0n, denominator: 1n },
+      ...options.select?.(ctx),
     }
     for (const rule of rules) {
       rule(input)
@@ -117,33 +133,32 @@ export function validationMiddleware<TTransaction extends Transaction>(
 export interface RetryOptions {
   /** Maximum number of attempts (including the first). */
   attempts: number
-  /** Base backoff in milliseconds between attempts. */
+  /** Backoff before the second attempt in milliseconds; doubles on every further attempt. */
   backoffMs: number
   /** Predicate deciding whether an error is retryable. */
   retryOn: (error: unknown) => boolean
 }
 
-/** Wraps the downstream chain in a retry loop. The chain is re-run from
- *  the point of this middleware on each attempt. */
+/** Wraps the downstream chain, submission included, in a retry loop. The chain
+ *  is re-run from the point of this middleware on each attempt, waiting
+ *  `backoffMs * 2^(attempt - 1)` between attempts. Gives up with the last
+ *  error after `attempts` tries or as soon as `retryOn` returns `false`. */
 export function retryMiddleware<TTransaction extends Transaction>(
   options: RetryOptions,
 ): Middleware<TTransaction, MiddlewareMetadata> {
   const { attempts, backoffMs, retryOn } = options
-  return async (ctx, next) => {
-    let lastError: unknown
-    for (let attempt = 1; attempt <= attempts; attempt++) {
+  return async (_ctx, next) => {
+    for (let attempt = 1; ; attempt++) {
       try {
         await next()
         return
       } catch (error) {
-        lastError = error
         if (attempt >= attempts || !retryOn(error)) {
           throw error
         }
-        await sleep(backoffMs * attempt)
+        await sleep(backoffMs * 2 ** (attempt - 1))
       }
     }
-    throw lastError ?? new MiddlewareAborted('retry exhausted')
   }
 }
 
@@ -173,27 +188,4 @@ export function loggingMiddleware<TTransaction extends Transaction>(
       throw error
     }
   }
-}
-
-// -------------------------------------------------------------------------------------------------------
-// Plugins
-// -------------------------------------------------------------------------------------------------------
-
-export interface PluginHooks<TTransaction extends Transaction = Transaction, TResult = unknown> {
-  beforeSend?: (tx: TTransaction) => Promise<void> | void
-  afterSend?: (result: TResult) => Promise<void> | void
-}
-
-export interface Plugin<TTransaction extends Transaction = Transaction, TResult = unknown> {
-  name: string
-  middleware: Middleware<TTransaction, MiddlewareMetadata>
-  hooks?: PluginHooks<TTransaction, TResult>
-}
-
-/** Registers a middleware plus lifecycle hooks on a client. The hooks
- *  are invoked by the client around the submission step. */
-export function plugin<TTransaction extends Transaction, TResult = unknown>(
-  definition: Plugin<TTransaction, TResult>,
-): Plugin<TTransaction, TResult> {
-  return definition
 }
